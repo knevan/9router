@@ -1,40 +1,49 @@
 name: Build and Push Docker Image
 
 on:
+  schedule:
+    - cron: "0 */6 * * *"
   push:
     tags:
       - "v*"
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Existing vX.Y.Z tag to publish"
-        required: true
+        description: "vX.Y.Z tag to publish (leave empty to auto-detect upstream latest)"
+        required: false
+        default: ""
         type: string
       promote_latest:
         description: "Promote this republish to latest"
         required: false
+        default: true
+        type: boolean
+      force_build:
+        description: "Force rebuild even if image already exists in GHCR"
+        required: false
         default: false
         type: boolean
 
-# Keep every release in one FIFO queue. A per-tag group would still allow an
-# older release to finish after a newer release and move latest backwards.
+# Keep every release in one FIFO queue.
 concurrency:
   group: docker-publish-${{ github.repository }}
   cancel-in-progress: false
-  queue: max
 
 env:
   DOCKERHUB_IMAGE: decolua/9router
+  UPSTREAM_REPO: decolua/9router
 
 jobs:
   prepare:
-    name: Validate release
+    name: Validate and prepare release
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: read
+      contents: write
+      packages: write
 
     outputs:
+      should_build: ${{ steps.release.outputs.should_build }}
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
       commit: ${{ steps.release.outputs.commit }}
@@ -43,88 +52,171 @@ jobs:
       ghcr_image: ${{ steps.release.outputs.ghcr_image }}
 
     steps:
-      - name: Check out release tag
+      - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.release_tag || github.ref_name }}
-          fetch-depth: 1
+          fetch-depth: 0
 
-      - name: Validate tag and package versions
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tag and validate
         id: release
         env:
-          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
-          REPOSITORY: ${{ github.repository }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
           EVENT_NAME: ${{ github.event_name }}
-          PROMOTE_LATEST_INPUT: ${{ inputs.promote_latest && 'true' || 'false' }}
+          PROMOTE_LATEST_INPUT: ${{ inputs.promote_latest != false && 'true' || 'false' }}
+          FORCE_BUILD_INPUT: ${{ inputs.force_build && 'true' || 'false' }}
+          REPOSITORY: ${{ github.repository }}
+          UPSTREAM_REPO: ${{ env.UPSTREAM_REPO }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           node <<'NODE'
-          const fs = require("fs");
           const { execFileSync } = require("child_process");
+          const fs = require("fs");
+          const https = require("https");
 
-          const tag = process.env.RELEASE_TAG || "";
-          const match = /^v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$/.exec(tag);
-
-          if (tag.includes("+")) {
-            console.error(`Build metadata is not supported in Docker release tags: ${tag}`);
-            process.exit(1);
+          function fetchJson(url) {
+            return new Promise((resolve, reject) => {
+              const req = https.get(url, {
+                headers: {
+                  "User-Agent": "GitHub-Actions-9router-Fork",
+                  "Accept": "application/vnd.github.v3+json",
+                  ...(process.env.GH_TOKEN ? { "Authorization": `token ${process.env.GH_TOKEN}` } : {})
+                }
+              }, res => {
+                let data = "";
+                res.on("data", chunk => data += chunk);
+                res.on("end", () => {
+                  try {
+                    resolve({ status: res.statusCode, body: JSON.parse(data) });
+                  } catch (e) {
+                    reject(new Error(`Failed to parse JSON from ${url}: ${e.message} - Response: ${data}`));
+                  }
+                });
+              });
+              req.on("error", reject);
+            });
           }
 
-          if (!match) {
-            console.error(`Expected a Docker-safe semver tag like v0.5.81 or v0.5.81-rc.1, received: ${tag || "<empty>"}`);
-            process.exit(1);
-          }
+          async function main() {
+            let tag = (process.env.INPUT_TAG || "").trim();
+            const eventName = process.env.EVENT_NAME;
+            const refName = process.env.GITHUB_REF_NAME;
+            const refType = process.env.GITHUB_REF_TYPE;
+            const upstream = process.env.UPSTREAM_REPO || "decolua/9router";
+            const repository = process.env.REPOSITORY || "";
+            const ghcrImage = `ghcr.io/${repository.toLowerCase()}`;
+            const forceBuild = process.env.FORCE_BUILD_INPUT === "true";
 
-          const version = match[1];
-          if (version.length > 128 || !/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/.test(version)) {
-            console.error(`Version is not a valid Docker tag: ${version}`);
-            process.exit(1);
-          }
+            // If tag is not manually provided, check push ref or fetch from upstream
+            if (!tag) {
+              if (eventName === "push" && refType === "tag" && refName) {
+                tag = refName;
+              } else {
+                console.log(`Fetching latest tags from upstream ${upstream}...`);
+                const { status, body: tags } = await fetchJson(`https://api.github.com/repos/${upstream}/tags?per_page=10`);
+                if (status !== 200 || !Array.isArray(tags) || tags.length === 0) {
+                  throw new Error(`Failed to fetch tags from upstream (status ${status}): ${JSON.stringify(tags)}`);
+                }
+                const semverTag = tags.find(t => /^v\d+\.\d+\.\d+/.test(t.name));
+                if (!semverTag) {
+                  throw new Error(`No semver tag found in upstream ${upstream}`);
+                }
+                tag = semverTag.name;
+                console.log(`Detected latest upstream tag: ${tag}`);
+              }
+            }
 
-          const prerelease = version.includes("-")
-            ? version.slice(version.indexOf("-") + 1).split(".")
-            : [];
-          for (const identifier of prerelease) {
-            if (/^\d+$/.test(identifier) && identifier.length > 1 && identifier.startsWith("0")) {
-              console.error(`Numeric prerelease identifiers cannot contain leading zeroes: ${identifier}`);
+            const match = /^v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$/.exec(tag);
+            if (tag.includes("+")) {
+              console.error(`Build metadata is not supported in Docker release tags: ${tag}`);
               process.exit(1);
             }
+            if (!match) {
+              console.error(`Expected a Docker-safe semver tag like v0.5.81 or v0.5.81-rc.1, received: ${tag || "<empty>"}`);
+              process.exit(1);
+            }
+
+            const version = match[1];
+
+            // Check if image already exists in GHCR
+            let imageExists = false;
+            try {
+              execFileSync("docker", ["manifest", "inspect", `${ghcrImage}:${version}`], { stdio: "pipe" });
+              imageExists = true;
+            } catch (err) {
+              imageExists = false;
+            }
+
+            console.log(`GHCR image ${ghcrImage}:${version} exists: ${imageExists}`);
+
+            if (imageExists && !forceBuild && eventName !== "push") {
+              console.log(`Image ${ghcrImage}:${version} already exists in GHCR and force_build is false. Skipping build.`);
+              const output = process.env.GITHUB_OUTPUT;
+              fs.appendFileSync(output, `should_build=false\n`);
+              fs.appendFileSync(output, `tag=${tag}\n`);
+              fs.appendFileSync(output, `version=${version}\n`);
+
+              const summary = process.env.GITHUB_STEP_SUMMARY;
+              if (summary) {
+                fs.appendFileSync(summary, `### ⏭️ Image already up to date\nImage \`${ghcrImage}:${version}\` already exists in GHCR. No build required.\n`);
+              }
+              return;
+            }
+
+            // Sync tag commit from upstream if needed
+            try {
+              execFileSync("git", ["remote", "add", "upstream", `https://github.com/${upstream}.git`], { stdio: "pipe" });
+            } catch (_) {}
+
+            console.log(`Fetching ref ${tag} from upstream...`);
+            execFileSync("git", ["fetch", "upstream", `refs/tags/${tag}:refs/tags/${tag}`, "--force"], { stdio: "inherit" });
+
+            const commit = execFileSync("git", ["rev-parse", `refs/tags/${tag}^{commit}`], { encoding: "utf8" }).trim();
+            console.log(`Resolved tag ${tag} to commit ${commit}`);
+
+            // Push tag to origin fork if not already present
+            try {
+              execFileSync("git", ["push", "origin", `refs/tags/${tag}`, "--force"], { stdio: "inherit" });
+              console.log(`Successfully synced tag ${tag} to origin fork`);
+            } catch (e) {
+              console.log(`Note: could not push tag ${tag} to origin: ${e.message}`);
+            }
+
+            const publishDockerHub = repository === "decolua/9router";
+            const isPrerelease = version.includes("-");
+            const promoteLatest = (eventName === "push" && !isPrerelease) || process.env.PROMOTE_LATEST_INPUT === "true";
+
+            const output = process.env.GITHUB_OUTPUT;
+            fs.appendFileSync(output, `should_build=true\n`);
+            fs.appendFileSync(output, `tag=${tag}\n`);
+            fs.appendFileSync(output, `version=${version}\n`);
+            fs.appendFileSync(output, `commit=${commit}\n`);
+            fs.appendFileSync(output, `publish_dockerhub=${publishDockerHub}\n`);
+            fs.appendFileSync(output, `promote_latest=${promoteLatest}\n`);
+            fs.appendFileSync(output, `ghcr_image=${ghcrImage}\n`);
+
+            console.log(`Prepared build for ${tag} at ${commit}`);
+            console.log(`latest promotion: ${promoteLatest ? "enabled" : "disabled"}`);
           }
 
-          const rootVersion = require("./package.json").version;
-          const cliVersion = require("./cli/package.json").version;
-
-          if (rootVersion !== version) {
-            console.error(`package.json version ${rootVersion} does not match tag ${tag}`);
+          main().catch(err => {
+            console.error(err);
             process.exit(1);
-          }
-
-          if (cliVersion !== version) {
-            console.error(`cli/package.json version ${cliVersion} does not match tag ${tag}`);
-            process.exit(1);
-          }
-
-          const commit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-          const publishDockerHub = process.env.REPOSITORY === "decolua/9router";
-          const ghcrImage = `ghcr.io/${process.env.REPOSITORY.toLowerCase()}`;
-          const isPrerelease = version.includes("-");
-          const promoteLatest = (process.env.EVENT_NAME === "push" && !isPrerelease)
-            || process.env.PROMOTE_LATEST_INPUT === "true";
-          const output = process.env.GITHUB_OUTPUT;
-
-          fs.appendFileSync(output, `tag=${tag}\n`);
-          fs.appendFileSync(output, `version=${version}\n`);
-          fs.appendFileSync(output, `commit=${commit}\n`);
-          fs.appendFileSync(output, `publish_dockerhub=${publishDockerHub}\n`);
-          fs.appendFileSync(output, `promote_latest=${promoteLatest}\n`);
-          fs.appendFileSync(output, `ghcr_image=${ghcrImage}\n`);
-
-          console.log(`Validated ${tag} at ${commit}`);
-          console.log(`latest promotion: ${promoteLatest ? "enabled" : "disabled"}`);
+          });
           NODE
 
   build:
     name: Build ${{ matrix.platform }}
     needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
@@ -151,6 +243,25 @@ jobs:
           ref: ${{ needs.prepare.outputs.commit }}
           path: source
           fetch-depth: 1
+
+      - name: Auto-sync package.json version to release tag
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const ver = process.env.APP_VERSION;
+          for (const file of ["source/package.json", "source/cli/package.json"]) {
+            if (fs.existsSync(file)) {
+              const data = JSON.parse(fs.readFileSync(file, "utf8"));
+              if (data.version !== ver) {
+                console.log(`Auto-syncing ${file}: ${data.version} -> ${ver}`);
+                data.version = ver;
+                fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+              }
+            }
+          }
+          NODE
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
 
       - name: Check out publishing Dockerfile
         uses: actions/checkout@v4
@@ -246,6 +357,7 @@ jobs:
     needs:
       - prepare
       - build
+    if: needs.prepare.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
